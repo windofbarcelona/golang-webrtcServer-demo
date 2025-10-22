@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebRTC 音频调试</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="p-4">
+<h1 class="text-2xl font-bold mb-4">WebRTC 音频调试</h1>
+
+<div id="status" class="p-3 bg-blue-100 mb-4">状态: 等待开始</div>
+<div id="logs" class="border p-3 h-80 overflow-y-auto mb-4 text-sm"></div>
+
+<button id="connect" class="bg-green-500 text-white px-4 py-2 mr-2">连接服务器</button>
+<button id="start" class="bg-blue-500 text-white px-4 py-2 mr-2" disabled>开始采集</button>
+<button id="reset" class="bg-red-500 text-white px-4 py-2" disabled>重置</button>
+
+<div class="mt-4">
+<h3 class="font-bold mb-2">远程音频:</h3>
+<audio id="remoteAudio" autoplay controls class="border p-2"></audio>
+</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const logsEl = document.getElementById('logs');
+const connectBtn = document.getElementById('connect');
+const startBtn = document.getElementById('start');
+const resetBtn = document.getElementById('reset');
+const remoteAudio = document.getElementById('remoteAudio');
+
+let ws, pc, stream;
+let pendingCandidates = [];
+
+function log(message) {
+    const time = new Date().toLocaleTimeString();
+    const div = document.createElement('div');
+    div.textContent = `[${time}] ${message}`;
+    logsEl.appendChild(div);
+    logsEl.scrollTop = logsEl.scrollHeight;
+    console.log(message);
+}
+
+function setStatus(text, isError=false) {
+    statusEl.textContent = `状态: ${text}`;
+    statusEl.className = isError ? 'p-3 bg-red-100 mb-4' : 'p-3 bg-blue-100 mb-4';
+    log(text);
+}
+
+// 连接WebSocket
+connectBtn.onclick = () => {
+    setStatus('连接WebSocket...');
+    connectBtn.disabled = true;
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+
+    ws.onopen = () => {
+        setStatus('WebSocket已连接，初始化PeerConnection');
+        resetBtn.disabled = false;
+        initPeerConnection();
+    };
+
+    ws.onmessage = e => {
+        handleMessage(e.data);
+    };
+
+    ws.onclose = () => {
+        setStatus('WebSocket已关闭', true);
+        reset();
+    };
+
+    ws.onerror = err => setStatus(`WebSocket错误: ${err}`, true);
+};
+
+// 初始化PeerConnection
+function initPeerConnection() {
+    const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    pc = new RTCPeerConnection(config);
+    log('PeerConnection创建成功');
+
+    pc.oniceconnectionstatechange = () => {
+        log(`ICE状态: ${pc.iceConnectionState}`);
+        if(pc.iceConnectionState==='connected') setStatus('ICE连接已建立，等待音频流...');
+        if(pc.iceConnectionState==='failed') setStatus('ICE连接失败', true);
+    };
+
+    pc.ontrack = (event) => {
+        log(`收到远程轨道: ${event.track.kind}, 流ID: ${event.streams[0].id}`);
+        if(event.track.kind==='audio' && !remoteAudio.srcObject) {
+            remoteAudio.srcObject = event.streams[0];
+            log('远程音频流已绑定');
+        }
+    };
+
+    pc.onicecandidate = e => {
+        if(e.candidate) {
+            log(`生成ICE候选者: ${e.candidate.candidate}`);
+            ws.send(JSON.stringify({ type:'candidate', candidate:e.candidate }));
+        } else {
+            log('ICE候选者收集完成');
+        }
+    };
+
+    startBtn.disabled = false;
+}
+
+// 处理服务器消息
+function handleMessage(data) {
+    if(!pc) return;
+    try {
+        const msg = JSON.parse(data);
+
+        if(msg.type==='answer') {
+            log('收到answer，设置远程描述');
+            pc.setRemoteDescription(new RTCSessionDescription(msg))
+                .then(()=>{
+                    setStatus('远程描述设置完成');
+                    // 添加缓存ICE候选
+                    pendingCandidates.forEach(c => {
+                        pc.addIceCandidate(new RTCIceCandidate(c))
+                            .then(()=>log('缓存ICE候选者添加成功'))
+                            .catch(err=>log(`缓存ICE候选者添加失败: ${err}`));
+                    });
+                    pendingCandidates=[];
+                }).catch(err=>setStatus(`设置远程描述失败: ${err}`, true));
+        } else if(msg.type==='candidate' && msg.candidate) {
+            if(!pc.remoteDescription) {
+                pendingCandidates.push(msg.candidate);
+                log(`缓存ICE候选者: ${msg.candidate.candidate}`);
+            } else {
+                pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
+                    .then(()=>log(`ICE候选者添加成功: ${msg.candidate.candidate}`))
+                    .catch(err=>setStatus(`添加ICE候选者失败: ${err}`, true));
+            }
+        }
+    } catch(err) {
+        setStatus(`处理消息失败: ${err}`, true);
+        log(`消息内容: ${data}`);
+    }
+}
+
+// 开始采集音频
+startBtn.onclick = async () => {
+    try {
+        setStatus('请求麦克风权限...');
+        //stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+        stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: { 
+                sampleRate: 8000, 
+                channelCount: 1 
+            } 
+        });
+        setStatus('麦克风访问成功');
+
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        log('本地音频轨道已添加');
+
+        const offer = await pc.createOffer({ offerToReceiveAudio:true });
+        offer.sdp
+          ?.replace(/a=fmtp:111/g, 'a=fmtp:111 minptime=10; useinbandfec=1')
+          .replace(/a=rtpmap:111 opus\/48000\/2/g, 'a=rtpmap:111 PCMU/8000')
+          .replace(/a=rtpmap:103 ISAC\/16000/g, 'a=rtpmap:103 PCMU/8000')
+          .replace(/a=rtpmap:104 ISAC\/32000/g, 'a=rtpmap:104 PCMU/8000');
+        await pc.setLocalDescription(offer);
+
+        // 等待ICE收集完成
+        await new Promise(resolve => {
+            if(pc.iceGatheringState==='complete') resolve();
+            else pc.addEventListener('icegatheringstatechange', function check(){
+                if(pc.iceGatheringState==='complete'){ pc.removeEventListener('icegatheringstatechange', check); resolve(); }
+            });
+        });
+
+        ws.send(JSON.stringify(pc.localDescription));
+        setStatus('offer已发送，等待服务器响应');
+        startBtn.disabled = true;
+    } catch(err) {
+        setStatus(`采集失败: ${err}`, true);
+    }
+};
+
+// 重置连接
+resetBtn.onclick = reset;
+function reset() {
+    log('重置所有资源');
+    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+    if(pc){ pc.close(); pc=null; }
+    if(ws){ ws.close(); ws=null; }
+    remoteAudio.srcObject=null;
+    pendingCandidates=[];
+    connectBtn.disabled=false;
+    startBtn.disabled=true;
+    resetBtn.disabled=true;
+    setStatus('所有资源已重置');
+}
+</script>
+</body>
+</html>

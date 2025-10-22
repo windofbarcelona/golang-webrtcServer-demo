@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebRTC 音频回环 Demo</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    button { padding: 6px 12px; margin-right: 10px; }
+    #log { white-space: pre-wrap; border: 1px solid #ccc; padding: 10px; height: 200px; overflow: auto; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC 音频回环 Demo</h2>
+  <button id="startBtn">开始</button>
+  <button id="stopBtn">停止</button>
+  <div id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function log(...args) {
+      logEl.textContent += args.join(' ') + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    let pc = null;
+    let localStream = null;
+    let remoteAudio = null;
+
+    document.getElementById('startBtn').onclick = async () => {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log('获取本地音频流');
+
+        // 提前创建一个 audio 元素，确保用户点击触发
+        remoteAudio = document.createElement('audio');
+        remoteAudio.autoplay = true;
+        remoteAudio.controls = true;
+        remoteAudio.muted = false;
+        remoteAudio.play().catch(err => log('播放失败:', err));
+        document.body.appendChild(remoteAudio);
+
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
+        });
+
+        setInterval(async () => {
+          if (!pc) return;
+          const stats = await pc.getStats();
+          stats.forEach(report => {
+            if (report.type === "inbound-rtp" && report.kind === "audio") {
+              console.log("Inbound packetsReceived:", report.packetsReceived);
+              console.log("Inbound bytesReceived:", report.bytesReceived);
+            }
+          });
+        }, 2000);
+
+        pc.ontrack = (event) => {
+          log('收到远端音频 track');
+          remoteAudio.srcObject = event.streams[0]; // 🔑 直接复用已有 audio
+        };
+
+        for (const track of localStream.getAudioTracks()) {
+          pc.addTrack(track, localStream);
+        }
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // 修改 POST 请求地址和头部信息
+        const response = await fetch('http://dcarx.dcarlife.net/motor/llm/agent_phone/dcc_phone_rtc', {
+          method: 'POST',
+          headers: {
+            'Host':'dcarx.dcarlife.net',
+            'x-tt-env': 'ppe_feat_newcar_tool',
+            'x-use-ppe': '1'
+          },
+          body: JSON.stringify({ type: offer.type, sdp: offer.sdp })
+        });
+
+        const answer = await response.json();
+        await pc.setRemoteDescription(answer);
+        log('设置远端 Answer 完成，回环建立');
+
+        pc.onconnectionstatechange = () => {
+          log('PeerConnection 状态: ' + pc.connectionState);
+        };
+
+      } catch (err) {
+        log('错误:', err);
+      }
+    };
+
+    document.getElementById('stopBtn').onclick = () => {
+      if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
+      }
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+      log('停止回环');
+    };
+  </script>
+</body>
+</html>
